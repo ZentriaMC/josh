@@ -11,6 +11,7 @@ jobs:
   generate-tags:
     runs-on: ubuntu-latest
     outputs:
+      ghcr_image: ${{ steps.generate-tags.outputs.ghcr_image }}
       run_tags_set: ${{ steps.generate-tags.outputs.run_tags_set }}
       tagged_images: ${{ steps.generate-tags.outputs.tagged_images }}
       should_build: ${{ steps.generate-tags.outputs.should_build }}
@@ -31,7 +32,8 @@ jobs:
           release_tag = "${{ github.event.release.tag_name }}"
           pr_number = "${{ github.event.pull_request.number }}"
 
-          ghcr_image_base = "ghcr.io/josh-project/josh-proxy"
+          # ghcr needs lowercase names.
+          ghcr_image_base = "ghcr.io/${{ github.repository_owner }}/josh-proxy".lower()
           dockerhub_image_base = "joshproject/josh-proxy"
 
           def main():
@@ -64,6 +66,8 @@ jobs:
 
               # Write to GITHUB_OUTPUT
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"ghcr_image={ghcr_image_base}\n")
+
                   f.write("run_tags_set<<EOF\n")
                   f.write(run_tags_set)
                   f.write("\nEOF\n")
@@ -212,11 +216,12 @@ jobs:
       - name: Create manifest lists and push tags
         working-directory: ${{ runner.temp }}/digests
         env:
+          GHCR_IMAGE: ${{ needs.generate-tags.outputs.ghcr_image }}
           TAGGED_IMAGES: ${{ needs.generate-tags.outputs.tagged_images }}
         run: |
           # The canonical image where digests were pushed during the build step
           # GHCR is always used for builds (see generate-tags job)
-          canonical_image="ghcr.io/josh-project/josh-proxy"
+          canonical_image="${GHCR_IMAGE}"
 
           # Build list of digest references for all architectures
           # Each file in this directory is named after a digest (without 'sha256:' prefix)
