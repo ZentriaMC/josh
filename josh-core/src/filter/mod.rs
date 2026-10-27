@@ -24,6 +24,7 @@ pub use josh_filter::{as_file, pretty, spec};
 mod object_deref;
 pub mod text;
 pub mod tree;
+mod workspace_config;
 
 pub fn as_tree(
     transaction: &cache::Transaction,
@@ -282,17 +283,20 @@ fn get_workspace(
     tree: gix_hash::ObjectId,
     reader: &tree::TreeReader,
     path: &Path,
-) -> Filter {
+) -> anyhow::Result<Filter> {
+    if let Some(config) = workspace_config::read(transaction, odb, reader, path)? {
+        return config.tree_filter(path);
+    }
     let wsj_file = Filter::new().file("workspace.josh");
     let base = to_filter(Op::Subdir(path.to_owned()));
     let wsj_file = base.chain(wsj_file);
-    compose(&[
+    Ok(compose(&[
         wsj_file,
         compose(&[
             get_filter(transaction, odb, tree, reader, &path.join("workspace.josh")),
             base,
         ]),
-    ])
+    ]))
 }
 
 fn get_stored(
@@ -546,8 +550,14 @@ impl RepositoryFilterResolver<'_> {
             }
             Op::Workspace(path) => {
                 let definition_path = path.join("workspace.josh");
-                let parsed = self.parsed_definition(reader, &definition_path)?;
-                if let Op::Workspace(redirect_path) = peel_op(parsed) {
+                if let Some(config) =
+                    workspace_config::read(self.transaction, self.odb, reader, &path)?
+                {
+                    config.tree_filter(&path)?
+                } else if let Op::Workspace(redirect_path) =
+                    peel_op(self.parsed_definition(reader, &definition_path)?)
+                {
+                    let parsed = self.parsed_definition(reader, &definition_path)?;
                     let redirect =
                         to_filter(Op::Exclude(Filter::new().file(&path))).chain(parsed.peel());
                     self.resolve(
@@ -820,6 +830,9 @@ pub fn apply_to_commit2(
             // Op::Empty, so bad input must error here; every probe below shares the read.
             let tree = commit.tree_id()?;
             let tree_reader = tree::read_tree(transaction, odb, tree)?;
+            if let Some(config) = workspace_config::read(transaction, odb, &tree_reader, ws_path)? {
+                return config_workspace_commit(transaction, &commit, filter, &config, ws_path);
+            }
             if let Some((redirect, _)) =
                 resolve_workspace_redirect(transaction, odb, &tree_reader, ws_path)
             {
@@ -831,14 +844,14 @@ pub fn apply_to_commit2(
                 }
             }
 
-            let commit_filter = get_workspace(transaction, odb, tree, &tree_reader, ws_path);
+            let commit_filter = get_workspace(transaction, odb, tree, &tree_reader, ws_path)?;
 
             let parent_filters = commit
                 .parent_ids()
                 .map(|parent| {
                     let tree_id = git::read_tree_id(odb, parent)?;
                     let reader = tree::read_tree(transaction, odb, tree_id)?;
-                    let pcw = get_workspace(transaction, odb, tree_id, &reader, ws_path);
+                    let pcw = get_workspace(transaction, odb, tree_id, &reader, ws_path)?;
                     Ok((parent, pcw))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -1237,7 +1250,7 @@ fn apply_impl(
             // below would fold it to Op::Empty), and every probe shares the one parse.
             let tree = x.tree_id();
             let tree_reader = tree::read_tree(transaction, odb, tree)?;
-            let f = get_workspace(transaction, odb, tree, &tree_reader, path);
+            let f = get_workspace(transaction, odb, tree, &tree_reader, path)?;
             apply_impl(transaction, odb, f, x)
         }
         Op::Stored(path) => {
@@ -1511,23 +1524,12 @@ fn unapply_per_rev_filter(
     match op {
         Op::Workspace(path) => {
             let odb = transaction.odb();
-            let tree = pre_process_tree(transaction, tree)?;
-            let tree_reader = tree::read_tree(transaction, odb, tree)?;
             let parent_reader = tree::read_tree(transaction, odb, parent_tree)?;
-            let workspace = get_filter(
-                transaction,
-                odb,
-                tree,
-                &tree_reader,
-                Path::new("workspace.josh"),
-            );
-            let original_workspace = get_filter(
-                transaction,
-                odb,
-                parent_tree,
-                &parent_reader,
-                &path.join("workspace.josh"),
-            );
+            let view_config = {
+                let view_reader = tree::read_tree(transaction, odb, tree)?;
+                workspace_config::read(transaction, odb, &view_reader, Path::new(""))?
+            };
+            let parent_config = workspace_config::read(transaction, odb, &parent_reader, path)?;
 
             let root = to_filter(Op::Subdir(path.to_owned()));
             let wsj_file = to_filter(Op::File(
@@ -1535,8 +1537,35 @@ fn unapply_per_rev_filter(
                 Path::new("workspace.josh").to_owned(),
             ));
             let wsj_file = root.chain(wsj_file);
-            let filter = compose(&[wsj_file, compose(&[workspace, root])]);
-            let original_filter = compose(&[wsj_file, compose(&[original_workspace, root])]);
+
+            let (tree, filter) = match view_config {
+                Some(config) => (tree, config.tree_filter(path)?),
+                None => {
+                    let tree = pre_process_tree(transaction, tree)?;
+                    let tree_reader = tree::read_tree(transaction, odb, tree)?;
+                    let workspace = get_filter(
+                        transaction,
+                        odb,
+                        tree,
+                        &tree_reader,
+                        Path::new("workspace.josh"),
+                    );
+                    (tree, compose(&[wsj_file, compose(&[workspace, root])]))
+                }
+            };
+            let original_filter = match parent_config {
+                Some(config) => config.tree_filter(path)?,
+                None => {
+                    let original_workspace = get_filter(
+                        transaction,
+                        odb,
+                        parent_tree,
+                        &parent_reader,
+                        &path.join("workspace.josh"),
+                    );
+                    compose(&[wsj_file, compose(&[original_workspace, root])])
+                }
+            };
             Ok(Some(reverse_strip_overlay(
                 transaction,
                 filter,
@@ -1870,6 +1899,49 @@ fn compute_splice_parents(
             .filter(|&oid| oid != gix_hash::ObjectId::null(gix_hash::Kind::Sha1))
             .collect(),
     ))
+}
+
+/// `:workspace=` for a commit with a `josh.toml`. Parents without one are filtered with this
+/// commit's config.
+fn config_workspace_commit(
+    transaction: &cache::Transaction,
+    commit: &objects::CommitData,
+    filter: Filter,
+    config: &workspace_config::WorkspaceConfig,
+    ws_path: &Path,
+) -> anyhow::Result<Option<gix_hash::ObjectId>> {
+    let odb = transaction.odb();
+    let meta = filter.into_meta();
+    let commit_filter = propagate_meta(config.tree_filter(ws_path)?, &meta);
+    let backfill = opt::optimize(commit_filter);
+
+    let mut filtered_parent_ids = Vec::new();
+    for parent in commit.parent_ids() {
+        let tree_id = git::read_tree_id(odb, parent)?;
+        let reader = tree::read_tree(transaction, odb, tree_id)?;
+        let path = normalize_path(&ws_path.join(workspace_config::FILE_NAME));
+        let filtered = if tree::get_path_entry_at(transaction, odb, &reader, &path)?.is_some() {
+            transaction.get(filter, parent)?
+        } else {
+            apply_to_commit2(backfill, parent, transaction)?
+        };
+        filtered_parent_ids.push(some_or!(filtered, { return Ok(None) }));
+    }
+
+    let tree_data = apply(
+        transaction,
+        commit_filter,
+        Rewrite::from_commit_data(commit)?,
+    )?;
+    Some(history::create_filtered_commit_with_meta(
+        commit,
+        filtered_parent_ids,
+        tree_data,
+        transaction,
+        filter,
+        commit_filter.into_meta(),
+    ))
+    .transpose()
 }
 
 fn per_rev_filter(

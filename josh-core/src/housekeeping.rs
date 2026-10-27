@@ -194,7 +194,7 @@ pub fn find_all_workspaces_and_subdirectories(
             return Ok(());
         }
 
-        if &entry.filename[..] == b"workspace.josh" {
+        if &entry.filename[..] == b"workspace.josh" || &entry.filename[..] == b"josh.toml" {
             hs.insert(format!(":workspace={}", root));
         }
         let v = format!("::{}/", root);
